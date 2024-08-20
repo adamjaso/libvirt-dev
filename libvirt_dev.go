@@ -20,25 +20,28 @@ import (
 
 type (
 	Config struct {
-		Name           string   // libvirt domain name (VM name)
-		Template       string   // libvirt domain XML filename to use as a template
-		Memory         uint     // memory to allocate
-		VCPU           uint     // number of vCPUs to allocate
-		BaseDisk       string   // local filename
-		Connect        string   // libvirt connect url, i.e. qemu+ssh://host/system
-		Net            string   // libvirt network name
-		NetBridge      string   // interface name, i.e. virbr*
-		NetRange       string   // private cidr
-		NetDNS         string   // nameserver IP
-		Pool           string   // libvirt pool name
-		PoolPath       string   // remote hypervisor directory
-		AuthorizedKeys string   // filename containing ssh public keys
-		Hypervisor     string   // IP address
-		Username       string   // ssh username configure with public keys
-		Routes         []string // custom local routes to libvirt network
-		Sudo           string   // command to as root command i.e. sudo, doas, etc
-		WaitSecs       int      // number of seconds to wait for instance to boot
-		Verbose        bool
+		Name            string              // libvirt domain name (VM name)
+		Template        string              // libvirt domain XML filename to use as a template
+		Memory          uint                // memory to allocate
+		VCPU            uint                // number of vCPUs to allocate
+		BaseDisk        string              // local filename
+		Connect         string              // libvirt connect url, i.e. qemu+ssh://host/system
+		Net             string              // libvirt network name
+		NetBridge       string              // interface name, i.e. virbr*
+		NetRange        string              // private cidr
+		NetDNS          string              // nameserver IP
+		NetDNSHostnames map[string][]string // libvirt network dns host aliases
+		Pool            string              // libvirt pool name
+		PoolPath        string              // remote hypervisor directory
+		AuthorizedKeys  string              // filename containing ssh public keys
+		Hypervisor      string              // IP address
+		Username        string              // ssh username configure with public keys
+		Routes          []string            // custom local routes to libvirt network
+		Sudo            string              // command to as root command i.e. sudo, doas, etc
+		WaitSecs        int                 // number of seconds to wait for instance to boot
+		RemoteDir       string              // remote rsync dir
+		RsyncOptions    []string            // custom rsync options
+		Verbose         bool
 
 		conn    *libvirt.Connect
 		pool    *libvirt.StoragePool
@@ -50,6 +53,7 @@ type (
 	deletableLibvirtEntity interface {
 		Destroy() error
 		Undefine() error
+		Free() error
 	}
 )
 
@@ -82,6 +86,19 @@ func deleteLibvirtEntity(kind, name string, entity deletableLibvirtEntity, ignor
 		}
 	}
 	log.Printf("deleted %s %q", kind, name)
+	return nil
+}
+
+func deleteStorageVol(name string, vol *libvirt.StorageVol) error {
+	log.Printf("deleting volume %q...", name)
+	if vol != nil {
+		if err := vol.Delete(libvirt.STORAGE_VOL_DELETE_NORMAL); err != nil {
+			if !IsErrorCode(err, libvirt.ERR_NO_STORAGE_VOL, libvirt.ERR_OPERATION_INVALID) {
+				return err
+			}
+		}
+		log.Printf("deleted volume %q", name)
+	}
 	return nil
 }
 
@@ -155,13 +172,13 @@ func LoadConfig(c *Config, filename string) error {
 		return err
 	} else if c.conn, err = libvirt.NewConnect(c.Connect); err != nil {
 		return err
+	} else if err := c.loadNetwork(); err != nil {
+		return err
 	} else if err := c.loadStoragePool(); err != nil {
 		return err
 	} else if err := c.loadBaseVol(); err != nil {
 		return err
 	} else if err := c.loadDomainVol(); err != nil {
-		return err
-	} else if err := c.loadNetwork(); err != nil {
 		return err
 	} else if err := c.loadDomain(); err != nil {
 		return err
@@ -171,7 +188,7 @@ func LoadConfig(c *Config, filename string) error {
 
 func (c *Config) DumpLoginInfo() error {
 	log.Printf("showing login info...")
-	ifaces, err := GetDomainInterfaces(c.conn, c.Name)
+	ifaces, err := GetDomainInterfaces(c.dom)
 	if err != nil {
 		return err
 	} else if len(ifaces) == 0 {
@@ -188,10 +205,14 @@ func (c *Config) DumpLoginInfo() error {
 	return nil
 }
 
-func IsErrorCode(err error, code libvirt.ErrorNumber) bool {
+func IsErrorCode(err error, code ...libvirt.ErrorNumber) bool {
 	if err != nil {
-		if verr, ok := err.(libvirt.Error); ok {
-			return verr.Code == code
+		for _, code := range code {
+			if verr, ok := err.(libvirt.Error); ok {
+				if verr.Code == code {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -237,10 +258,7 @@ func (c *Config) loadDomainVol() error {
 	return nil
 }
 
-func (c *Config) initStorage() error {
-	if err := c.loadStoragePool(); err != nil {
-		return err
-	}
+func (c *Config) initPool() error {
 	if c.pool == nil {
 		log.Printf("creating pool %q", c.Pool)
 		pool := &libvirtxml.StoragePool{
@@ -269,9 +287,19 @@ func (c *Config) initStorage() error {
 			return err
 		}
 	}
-	if err := c.loadBaseVol(); err != nil {
+	return nil
+}
+
+func (c *Config) delBaseVol() error {
+	log.Printf("deleting base volume %q...", filepath.Base(c.BaseDisk))
+	if err := deleteStorageVol(filepath.Base(c.BaseDisk), c.baseVol); err != nil {
 		return err
 	}
+	log.Printf("deleted base volume %q", filepath.Base(c.BaseDisk))
+	return nil
+}
+
+func (c *Config) initBaseVol() error {
 	if c.baseVol == nil {
 		base := filepath.Base(c.BaseDisk)
 		log.Printf(`creating base volume "%s/%s"`, c.Pool, base)
@@ -309,7 +337,8 @@ func (c *Config) initStorage() error {
 			return err
 		}
 		defer upload.Free()
-		if err := c.baseVol.Upload(upload, 0, uint64(stat.Size()), 0); err != nil {
+		totalBytes := stat.Size()
+		if err := c.baseVol.Upload(upload, 0, uint64(totalBytes), 0); err != nil {
 			return err
 		}
 		tot := int64(0)
@@ -319,8 +348,8 @@ func (c *Config) initStorage() error {
 			if err == io.EOF {
 				return nil, nil
 			}
-			tot += int64(len(buf))
-			fmt.Printf("copied %d bytes\r", tot)
+			tot += int64(n)
+			fmt.Printf("Uploaded % 9d MiB / %d MiB (%1.2f %%)\r", tot/1024/1024, totalBytes/1024/1024, float64(tot)/float64(totalBytes)*100)
 			return buf[:n], err
 		})
 		if err != nil {
@@ -332,38 +361,6 @@ func (c *Config) initStorage() error {
 			return err
 		}
 		log.Printf(`uploading base complete "%s/%s"`, c.Pool, base)
-	}
-	if err := c.loadDomainVol(); err != nil {
-		return err
-	}
-	if c.vol == nil {
-		log.Printf(`creating volume "%s/%s"...`, c.Pool, c.Disk())
-		info, err := c.baseVol.GetInfo()
-		if err != nil {
-			return err
-		}
-		vol := &libvirtxml.StorageVolume{
-			Name:       c.Disk(),
-			Capacity:   &libvirtxml.StorageVolumeSize{Value: info.Capacity, Unit: "bytes"},
-			Allocation: &libvirtxml.StorageVolumeSize{Value: info.Allocation, Unit: "bytes"},
-			Target: &libvirtxml.StorageVolumeTarget{
-				Format: &libvirtxml.StorageVolumeTargetFormat{
-					Type: "qcow2",
-				},
-			},
-		}
-		volXML, err := vol.Marshal()
-		if err != nil {
-			return err
-		}
-		if c.Verbose {
-			fmt.Println(volXML)
-		}
-		c.vol, err = c.pool.StorageVolCreateXMLFrom(volXML, c.baseVol, 0)
-		if err != nil {
-			return err
-		}
-		log.Printf(`created volume "%s/%s"`, c.Pool, c.Disk())
 	}
 	return nil
 }
@@ -380,66 +377,69 @@ func (c *Config) loadNetwork() error {
 }
 
 func (c *Config) initNetwork() error {
-	//if err := c.loadNetwork(); err != nil {
-	//	return err
-	//}
-	if c.net == nil {
-		log.Printf("creating net %q", c.Net)
-		prefix, err := netip.ParsePrefix(c.NetRange)
-		if err != nil {
-			return err
-		}
-		net := &libvirtxml.Network{
-			Name: c.Net,
-			Forward: &libvirtxml.NetworkForward{
-				Mode: "open",
+	if c.net != nil {
+		return nil
+	}
+	log.Printf("creating net %q", c.Net)
+	prefix, err := netip.ParsePrefix(c.NetRange)
+	if err != nil {
+		return err
+	}
+	net := &libvirtxml.Network{
+		Name: c.Net,
+		Forward: &libvirtxml.NetworkForward{
+			Mode: "open",
+		},
+		Bridge: &libvirtxml.NetworkBridge{
+			Name:  c.NetBridge,
+			STP:   "on",
+			Delay: "0",
+		},
+		DNS: &libvirtxml.NetworkDNS{
+			Forwarders: []libvirtxml.NetworkDNSForwarder{
+				{Addr: c.NetDNS},
 			},
-			Bridge: &libvirtxml.NetworkBridge{
-				Name:  c.NetBridge,
-				STP:   "on",
-				Delay: "0",
-			},
-			DNS: &libvirtxml.NetworkDNS{
-				Forwarders: []libvirtxml.NetworkDNSForwarder{
-					{Addr: c.NetDNS},
-				},
-			},
-			IPs: []libvirtxml.NetworkIP{
-				{
-					Address:  prefix.Addr().Next().String(),
-					Netmask:  MaskAddr(prefix).String(),
-					LocalPtr: "yes",
-					DHCP: &libvirtxml.NetworkDHCP{
-						Ranges: []libvirtxml.NetworkDHCPRange{
-							{
-								Start: prefix.Addr().Next().Next().String(),
-								End:   BroadcastAddr(prefix).Prev().String(),
-								Lease: &libvirtxml.NetworkDHCPLease{
-									Expiry: 1,
-									Unit:   "hours",
-								},
+		},
+		IPs: []libvirtxml.NetworkIP{
+			{
+				Address:  prefix.Addr().Next().String(),
+				Netmask:  MaskAddr(prefix).String(),
+				LocalPtr: "yes",
+				DHCP: &libvirtxml.NetworkDHCP{
+					Ranges: []libvirtxml.NetworkDHCPRange{
+						{
+							Start: prefix.Addr().Next().Next().String(),
+							End:   BroadcastAddr(prefix).Prev().String(),
+							Lease: &libvirtxml.NetworkDHCPLease{
+								Expiry: 1,
+								Unit:   "hours",
 							},
 						},
 					},
 				},
 			},
-		}
-		netXML, err := net.Marshal()
-		if err != nil {
-			return err
-		}
-		if c.Verbose {
-			fmt.Println(netXML)
-		}
-		if c.net, err = c.conn.NetworkDefineXML(netXML); err != nil {
-			return err
-		} else if err := c.net.SetAutostart(true); err != nil {
-			return err
-		} else if err := c.net.Create(); err != nil {
-			return err
-		}
-		log.Printf("created net %q", c.Net)
+		},
+		DnsmasqOptions: &libvirtxml.NetworkDnsmasqOptions{
+			Option: []libvirtxml.NetworkDnsmasqOption{
+				{Value: "address=/"},
+			},
+		},
 	}
+	netXML, err := net.Marshal()
+	if err != nil {
+		return err
+	}
+	if c.Verbose {
+		fmt.Println(netXML)
+	}
+	if c.net, err = c.conn.NetworkDefineXML(netXML); err != nil {
+		return err
+	} else if err := c.net.SetAutostart(true); err != nil {
+		return err
+	} else if err := c.net.Create(); err != nil {
+		return err
+	}
+	log.Printf("created net %q", c.Net)
 	return nil
 }
 
@@ -484,6 +484,8 @@ func (c *Config) initHostname() error {
 	if cErr != nil {
 		log.Printf("setting hostname failed to close /etc/hostname")
 	}
+	//_, _ = ExecuteQemuAgentCommand(c.dom, "guest-execute", 1,
+	//	"path", "/bin/hostname", "arg", []string{"-F", "/etc/hostname"})
 	return err
 }
 
@@ -506,10 +508,27 @@ func (c *Config) delRoutes() error {
 }
 
 func (c *Config) delDomain() error {
+	if err := deleteStorageVol(c.Disk(), c.vol); err != nil {
+		return err
+	}
 	return deleteLibvirtEntity("domain", c.Name, c.dom, libvirt.ERR_NO_DOMAIN, libvirt.ERR_OPERATION_INVALID)
 }
 
-func (c *Config) delStorage() error {
+func (c *Config) delPoolVols() error {
+	vols, err := c.pool.ListAllStorageVolumes(0)
+	if err != nil {
+		return err
+	}
+	for _, vol := range vols {
+		name, _ := vol.GetName()
+		if err := deleteStorageVol(name, &vol); err != nil {
+			log.Println(err)
+		}
+	}
+	return nil
+}
+
+func (c *Config) delPool() error {
 	return deleteLibvirtEntity("storage pool", c.Pool, c.pool, libvirt.ERR_NO_STORAGE_POOL, libvirt.ERR_OPERATION_INVALID)
 }
 
@@ -528,10 +547,47 @@ func (c *Config) loadDomain() error {
 	return nil
 }
 
+func (c *Config) initDomainVol() error {
+	if err := c.loadDomainVol(); err != nil {
+		return err
+	}
+	if c.vol != nil {
+		return nil
+	}
+	log.Printf(`creating domain volume "%s/%s"...`, c.Pool, c.Disk())
+	info, err := c.baseVol.GetInfo()
+	if err != nil {
+		return err
+	}
+	vol := &libvirtxml.StorageVolume{
+		Name:       c.Disk(),
+		Capacity:   &libvirtxml.StorageVolumeSize{Value: info.Capacity, Unit: "bytes"},
+		Allocation: &libvirtxml.StorageVolumeSize{Value: info.Allocation, Unit: "bytes"},
+		Target: &libvirtxml.StorageVolumeTarget{
+			Format: &libvirtxml.StorageVolumeTargetFormat{
+				Type: "qcow2",
+			},
+		},
+	}
+	volXML, err := vol.Marshal()
+	if err != nil {
+		return err
+	}
+	if c.Verbose {
+		fmt.Println(volXML)
+	}
+	c.vol, err = c.pool.StorageVolCreateXMLFrom(volXML, c.baseVol, 0)
+	if err != nil {
+		return err
+	}
+	log.Printf(`created domain volume "%s/%s"`, c.Pool, c.Disk())
+	return nil
+}
+
 func (c *Config) initDomain() error {
-	//if err := c.loadDomain(); err != nil {
-	//	return err
-	//}
+	if err := c.initDomainVol(); err != nil {
+		return err
+	}
 	if c.dom == nil {
 		log.Printf("creating domain %q", c.Name)
 		dom, err := ReadDomainXML(c.Template)
@@ -547,14 +603,20 @@ func (c *Config) initDomain() error {
 			fmt.Println(domXML)
 		}
 		if c.dom, err = c.conn.DomainDefineXML(domXML); err != nil {
-			return err
+			if !IsErrorCode(err, libvirt.ERR_OPERATION_INVALID) {
+				return err
+			}
 		} else if err := c.dom.SetAutostart(true); err != nil {
 			return err
 		}
 		log.Printf("created domain %q", c.Name)
 	}
-	if err := c.dom.CreateWithFlags(libvirt.DOMAIN_START_FORCE_BOOT); err != nil {
+	if state, _, err := c.dom.GetState(); err != nil {
 		return err
+	} else if state != libvirt.DOMAIN_RUNNING {
+		if err := c.dom.CreateWithFlags(libvirt.DOMAIN_START_FORCE_BOOT); err != nil {
+			return err
+		}
 	}
 	if err := WaitUntilPing(c.dom, c.WaitSecs); err != nil {
 		return err

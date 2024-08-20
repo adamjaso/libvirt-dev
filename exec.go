@@ -37,7 +37,3 @@ func ModifyRoutes(ctx context.Context, su, command string, routes ...string) err
 	}
 	return err
 }
-
-func IsRoot() bool {
-	return os.Getuid() == 0
-}

@@ -30,22 +30,6 @@ func ConfigureDomainXML(dom *libvirtxml.Domain, name string, vcpu, memoryMiB uin
 		Unit:  "MiB",
 	}
 	dom.Devices.Interfaces = []libvirtxml.DomainInterface{
-		/*
-			<interface type='bridge'>
-			  <source bridge='virbr0'/>
-			  <model type='virtio'/>
-			</interface>
-		*/
-		{
-			Source: &libvirtxml.DomainInterfaceSource{
-				Bridge: &libvirtxml.DomainInterfaceSourceBridge{
-					Bridge: netBridgeIfname,
-				},
-			},
-			Model: &libvirtxml.DomainInterfaceModel{
-				Type: "virtio",
-			},
-		},
 		{
 			Source: &libvirtxml.DomainInterfaceSource{
 				Network: &libvirtxml.DomainInterfaceSourceNetwork{

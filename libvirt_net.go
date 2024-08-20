@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
+	"log"
 	"math"
 	"net/netip"
 
@@ -43,16 +45,32 @@ func PrefixMaskToCIDR(prefixStr, maskStr string) (netip.Prefix, error) {
 	return prefix.Prefix(bits)
 }
 
-func GetDomainInterfaces(conn *libvirt.Connect, domainName string) ([]libvirt.DomainInterface, error) {
-	dom, err := conn.LookupDomainByName(domainName)
-	if err != nil {
-		return nil, err
+func GetDomainInterfaces(dom *libvirt.Domain) ([]libvirt.DomainInterface, error) {
+	sources := []libvirt.DomainInterfaceAddressesSource{
+		libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE,
+		//libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT,
 	}
-	ifaces, err := dom.ListAllInterfaceAddresses(libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE)
-	if err != nil {
-		return nil, err
+	for _, source := range sources {
+		if ifaces, err := dom.ListAllInterfaceAddresses(source); err != nil {
+			return nil, err
+		} else if len(ifaces) > 0 {
+			return ifaces, nil
+		}
 	}
-	return ifaces, nil
+	return []libvirt.DomainInterface{}, nil
+}
+
+func GetDomainIPAddress(dom *libvirt.Domain) (*libvirt.DomainIPAddress, error) {
+	if ifaces, err := GetDomainInterfaces(dom); err != nil {
+		return nil, err
+	} else if len(ifaces) > 0 {
+		for _, addr := range ifaces[0].Addrs {
+			if addr.Type == libvirt.IP_ADDR_TYPE_IPV4 {
+				return &addr, nil
+			}
+		}
+	}
+	return nil, errors.New("domain interfaces not found")
 }
 
 func GetNetworkPrefix(net *libvirt.Network) (netip.Prefix, error) {
@@ -65,4 +83,73 @@ func GetNetworkPrefix(net *libvirt.Network) (netip.Prefix, error) {
 		return netip.Prefix{}, err
 	}
 	return PrefixMaskToCIDR(netdef.IPs[0].Address, netdef.IPs[0].Netmask)
+}
+
+func (c *Config) syncDomainNamesToNetworkDNS() error {
+	net, err := c.conn.LookupNetworkByName(c.Net)
+	if err != nil {
+		return err
+	}
+	netDef := &libvirtxml.Network{}
+	netXML, err := net.GetXMLDesc(0)
+	if err != nil {
+		return err
+	} else if err := netDef.Unmarshal(netXML); err != nil {
+		return err
+	}
+	if netDef.DNS == nil {
+		netDef.DNS = &libvirtxml.NetworkDNS{
+			Forwarders: []libvirtxml.NetworkDNSForwarder{
+				{Addr: c.NetDNS},
+			},
+		}
+		return errors.New("network has no network.dns.host section")
+	}
+	if netDef.DNS.Host == nil {
+		netDef.DNS.Host = []libvirtxml.NetworkDNSHost{}
+	}
+	doms, err := c.conn.ListAllDomains(libvirt.CONNECT_LIST_DOMAINS_PERSISTENT | libvirt.CONNECT_LIST_DOMAINS_RUNNING)
+	if err != nil {
+		return err
+	}
+	for _, h := range netDef.DNS.Host {
+		if hostXML, err := h.Marshal(); err != nil {
+			return err
+		} else if err := c.net.Update(libvirt.NETWORK_UPDATE_COMMAND_DELETE, libvirt.NETWORK_SECTION_DNS_HOST, -1, hostXML, 0); err != nil {
+			return err
+		}
+	}
+	for _, dom := range doms {
+		ifaces, err := dom.ListAllInterfaceAddresses(libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE)
+		if err != nil {
+			return err
+		}
+		domName, _ := dom.GetName()
+		for _, iface := range ifaces {
+			for _, addr := range iface.Addrs {
+				if addr.Type == libvirt.IP_ADDR_TYPE_IPV4 {
+					if c.Verbose {
+						log.Printf("dns entry %q maps to %q", domName, addr.Addr)
+					}
+					h := libvirtxml.NetworkDNSHost{
+						Hostnames: []libvirtxml.NetworkDNSHostHostname{
+							{Hostname: domName},
+						},
+						IP: addr.Addr,
+					}
+					if aliases, ok := c.NetDNSHostnames[domName]; ok {
+						for _, alias := range aliases {
+							h.Hostnames = append(h.Hostnames, libvirtxml.NetworkDNSHostHostname{Hostname: alias})
+						}
+					}
+					if hostXML, err := h.Marshal(); err != nil {
+						return err
+					} else if err := c.net.Update(libvirt.NETWORK_UPDATE_COMMAND_ADD_LAST, libvirt.NETWORK_SECTION_DNS_HOST, -1, hostXML, 0); err != nil {
+						return err
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
