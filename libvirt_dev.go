@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -31,6 +32,7 @@ type (
 		NetRange        string              // private cidr
 		NetDNS          string              // nameserver IP
 		NetDNSHostnames map[string][]string // libvirt network dns host aliases
+		NetMode         string              //libvirt network forward "mode" (i.e. open,bridge are supported)
 		Pool            string              // libvirt pool name
 		PoolPath        string              // remote hypervisor directory
 		AuthorizedKeys  string              // filename containing ssh public keys
@@ -41,6 +43,7 @@ type (
 		WaitSecs        int                 // number of seconds to wait for instance to boot
 		RemoteDir       string              // remote rsync dir
 		RsyncOptions    []string            // custom rsync options
+		DomainIfname    string              // domain interface name (i.e. eth0)
 		Verbose         bool
 
 		conn    *libvirt.Connect
@@ -387,20 +390,21 @@ func (c *Config) initNetwork() error {
 	}
 	net := &libvirtxml.Network{
 		Name: c.Net,
-		Forward: &libvirtxml.NetworkForward{
-			Mode: "open",
-		},
-		Bridge: &libvirtxml.NetworkBridge{
-			Name:  c.NetBridge,
-			STP:   "on",
-			Delay: "0",
-		},
 		DNS: &libvirtxml.NetworkDNS{
+			ForwardPlainNames: "no",
 			Forwarders: []libvirtxml.NetworkDNSForwarder{
 				{Addr: c.NetDNS},
 			},
 		},
-		IPs: []libvirtxml.NetworkIP{
+		Forward: &libvirtxml.NetworkForward{
+			Mode: c.NetMode,
+		},
+		Bridge: &libvirtxml.NetworkBridge{
+			Name: c.NetBridge,
+		},
+	}
+	if c.NetMode == "open" {
+		net.IPs = []libvirtxml.NetworkIP{
 			{
 				Address:  prefix.Addr().Next().String(),
 				Netmask:  MaskAddr(prefix).String(),
@@ -418,12 +422,14 @@ func (c *Config) initNetwork() error {
 					},
 				},
 			},
-		},
-		DnsmasqOptions: &libvirtxml.NetworkDnsmasqOptions{
-			Option: []libvirtxml.NetworkDnsmasqOption{
-				{Value: "address=/"},
-			},
-		},
+		}
+		//DnsmasqOptions: &libvirtxml.NetworkDnsmasqOptions{
+		//	Option: []libvirtxml.NetworkDnsmasqOption{
+		//		{Value: "address=/"},
+		//	},
+		//},
+	} else if c.NetMode != "bridge" {
+		log.Printf("WARN: net mode=%q may not be supported", c.NetMode)
 	}
 	netXML, err := net.Marshal()
 	if err != nil {
@@ -624,6 +630,39 @@ func (c *Config) initDomain() error {
 		return err
 	} else if err := c.initHostname(); err != nil {
 		return err
+	} else if err := c.syncDomainNamesToNetworkDNS(); err != nil {
+		return err
 	}
 	return nil
+}
+
+func (c *Config) restartAllDomains() error {
+	doms, err := c.conn.ListAllDomains(libvirt.CONNECT_LIST_DOMAINS_PERSISTENT | libvirt.CONNECT_LIST_DOMAINS_RUNNING)
+	if err != nil {
+		return err
+	}
+	log.Printf("restarting network %q...", c.Net)
+	if err := c.net.Destroy(); err != nil {
+		return err
+	} else if err := c.net.Create(); err != nil {
+		return err
+	}
+	log.Printf("restarted network %q", c.Net)
+	for _, dom := range doms {
+		domName, _ := dom.GetName()
+		log.Printf("restarting domain %q...", domName)
+		if e := dom.DestroyFlags(libvirt.DOMAIN_DESTROY_DEFAULT); e != nil {
+			if err == nil {
+				err = errors.New("failed to restart domain(s):\n")
+			}
+			err = fmt.Errorf("%w  destroy error: %v\n", err, e)
+		} else if e := dom.CreateWithFlags(libvirt.DOMAIN_START_FORCE_BOOT); e != nil {
+			if err == nil {
+				err = errors.New("failed to restart domain(s):\n")
+			}
+			err = fmt.Errorf("%w  create error: %v\n", err, e)
+		}
+		log.Printf("restarted domain %q", domName)
+	}
+	return err
 }

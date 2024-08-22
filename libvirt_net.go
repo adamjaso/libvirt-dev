@@ -47,8 +47,8 @@ func PrefixMaskToCIDR(prefixStr, maskStr string) (netip.Prefix, error) {
 
 func GetDomainInterfaces(dom *libvirt.Domain) ([]libvirt.DomainInterface, error) {
 	sources := []libvirt.DomainInterfaceAddressesSource{
-		libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE,
-		//libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT,
+		//libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE,
+		libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT,
 	}
 	for _, source := range sources {
 		if ifaces, err := dom.ListAllInterfaceAddresses(source); err != nil {
@@ -60,13 +60,26 @@ func GetDomainInterfaces(dom *libvirt.Domain) ([]libvirt.DomainInterface, error)
 	return []libvirt.DomainInterface{}, nil
 }
 
-func GetDomainIPAddress(dom *libvirt.Domain) (*libvirt.DomainIPAddress, error) {
+func (c *Config) getDomainIPAddress(dom *libvirt.Domain) (*libvirt.DomainIPAddress, error) {
 	if ifaces, err := GetDomainInterfaces(dom); err != nil {
 		return nil, err
 	} else if len(ifaces) > 0 {
-		for _, addr := range ifaces[0].Addrs {
-			if addr.Type == libvirt.IP_ADDR_TYPE_IPV4 {
-				return &addr, nil
+		for _, iface := range ifaces {
+			if c.DomainIfname != "" {
+				if c.DomainIfname != iface.Name {
+					continue
+				}
+				if c.Verbose {
+					domName, _ := dom.GetName()
+					log.Printf("domain %s selecting preferred interface %q", domName, iface.Name)
+				}
+			} else if iface.Name == "" || iface.Name == "lo" {
+				continue
+			}
+			for _, addr := range iface.Addrs {
+				if addr.Type == libvirt.IP_ADDR_TYPE_IPV4 {
+					return &addr, nil
+				}
 			}
 		}
 	}
@@ -86,12 +99,8 @@ func GetNetworkPrefix(net *libvirt.Network) (netip.Prefix, error) {
 }
 
 func (c *Config) syncDomainNamesToNetworkDNS() error {
-	net, err := c.conn.LookupNetworkByName(c.Net)
-	if err != nil {
-		return err
-	}
 	netDef := &libvirtxml.Network{}
-	netXML, err := net.GetXMLDesc(0)
+	netXML, err := c.net.GetXMLDesc(0)
 	if err != nil {
 		return err
 	} else if err := netDef.Unmarshal(netXML); err != nil {
@@ -120,36 +129,54 @@ func (c *Config) syncDomainNamesToNetworkDNS() error {
 		}
 	}
 	for _, dom := range doms {
-		ifaces, err := dom.ListAllInterfaceAddresses(libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_LEASE)
+		ifaces, err := dom.ListAllInterfaceAddresses(libvirt.DOMAIN_INTERFACE_ADDRESSES_SRC_AGENT)
 		if err != nil {
 			return err
 		}
 		domName, _ := dom.GetName()
-		for _, iface := range ifaces {
-			for _, addr := range iface.Addrs {
-				if addr.Type == libvirt.IP_ADDR_TYPE_IPV4 {
-					if c.Verbose {
-						log.Printf("dns entry %q maps to %q", domName, addr.Addr)
-					}
-					h := libvirtxml.NetworkDNSHost{
-						Hostnames: []libvirtxml.NetworkDNSHostHostname{
-							{Hostname: domName},
-						},
-						IP: addr.Addr,
-					}
-					if aliases, ok := c.NetDNSHostnames[domName]; ok {
-						for _, alias := range aliases {
-							h.Hostnames = append(h.Hostnames, libvirtxml.NetworkDNSHostHostname{Hostname: alias})
-						}
-					}
-					if hostXML, err := h.Marshal(); err != nil {
-						return err
-					} else if err := c.net.Update(libvirt.NETWORK_UPDATE_COMMAND_ADD_LAST, libvirt.NETWORK_SECTION_DNS_HOST, -1, hostXML, 0); err != nil {
-						return err
-					}
-				}
-			}
+		if len(ifaces) == 0 {
+			log.Printf("WARN: no dns entries for domain %q", domName)
 		}
+		domAddr, err := c.getDomainIPAddress(&dom)
+		if c.Verbose {
+			log.Printf("dns entry %q maps to %q", domName, domAddr.Addr)
+		}
+		h := libvirtxml.NetworkDNSHost{
+			Hostnames: []libvirtxml.NetworkDNSHostHostname{
+				{Hostname: domName},
+			},
+			IP: domAddr.Addr,
+		}
+		if hostXML, err := h.Marshal(); err != nil {
+			return err
+		} else if err := c.net.Update(libvirt.NETWORK_UPDATE_COMMAND_ADD_LAST, libvirt.NETWORK_SECTION_DNS_HOST, -1, hostXML, 0); err != nil {
+			return err
+		}
+		//for _, iface := range ifaces {
+		//	for _, addr := range iface.Addrs {
+		//		if addr.Type == libvirt.IP_ADDR_TYPE_IPV4 {
+		//			if c.Verbose {
+		//				log.Printf("dns entry %q maps to %q", domName, addr.Addr)
+		//			}
+		//			h := libvirtxml.NetworkDNSHost{
+		//				Hostnames: []libvirtxml.NetworkDNSHostHostname{
+		//					{Hostname: domName},
+		//				},
+		//				IP: addr.Addr,
+		//			}
+		//			if aliases, ok := c.NetDNSHostnames[domName]; ok {
+		//				for _, alias := range aliases {
+		//					h.Hostnames = append(h.Hostnames, libvirtxml.NetworkDNSHostHostname{Hostname: alias})
+		//				}
+		//			}
+		//			if hostXML, err := h.Marshal(); err != nil {
+		//				return err
+		//			} else if err := c.net.Update(libvirt.NETWORK_UPDATE_COMMAND_ADD_LAST, libvirt.NETWORK_SECTION_DNS_HOST, -1, hostXML, 0); err != nil {
+		//				return err
+		//			}
+		//		}
+		//	}
+		//}
 	}
 	return nil
 }

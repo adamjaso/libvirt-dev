@@ -19,9 +19,9 @@ func main() {
 		addBaseVol, delBaseVol        bool
 		addDomVol, delDomVol          bool
 		addRoutes, delRoutes          bool
-		syncDNS                       bool
-		sync                          string
-		configfile                    string
+		syncDNS, restartAllDoms       bool
+		syncConf, rsync               string
+		configfile, sshSubsystem      string
 	)
 	flag.BoolVar(&addAll, "addall", false, "Create storage, network, and domain")
 	flag.BoolVar(&delAll, "delall", false, "Delete all storage, network, and domain")
@@ -39,10 +39,13 @@ func main() {
 	flag.BoolVar(&addRoutes, "addroutes", false, "Add routes")
 	flag.BoolVar(&delRoutes, "delroutes", false, "Del routes")
 	flag.BoolVar(&syncDNS, "syncdns", false, "Sync DNS between domains and network")
+	flag.BoolVar(&restartAllDoms, "restartalldoms", false, "Destroy/create all domains")
 
 	flag.BoolVar(&c.Verbose, "v", false, "Verbose output")
-	flag.StringVar(&sync, "sync", "", "Execute sync command from local dir to remote host (see config RemoteDir)")
+	flag.StringVar(&syncConf, "syncconf", "", "Sync config to domain")
+	flag.StringVar(&rsync, "rsync", "", "Execute sync command from local dir to remote host (see config RemoteDir)")
 	flag.StringVar(&c.Name, "n", "", "Libvirt domain name (VM name)")
+	flag.StringVar(&sshSubsystem, "ssh", "", "SSH subsystem to invoke (may require sshd_config customization)")
 	flag.StringVar(&configfile, "c", "", "Config file")
 	flag.Parse()
 
@@ -133,6 +136,10 @@ func main() {
 		if err := c.delDomain(); err != nil {
 			log.Println(err)
 		}
+	} else if restartAllDoms {
+		if err := c.restartAllDomains(); err != nil {
+			log.Println(err)
+		}
 	} else if syncDNS {
 		if err := c.syncDomainNamesToNetworkDNS(); err != nil {
 			log.Println(err)
@@ -140,12 +147,16 @@ func main() {
 	} else {
 		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		go func() {
-			if sync != "" {
-				if err := doRsync(ctx, &c, sync); err != nil {
+			if rsync != "" {
+				if err := doRsync(ctx, &c, rsync); err != nil {
+					log.Println(err)
+				}
+			} else if syncConf != "" {
+				if err := doConfigure(ctx, &c, "syncconf", syncConf); err != nil {
 					log.Println(err)
 				}
 			} else {
-				if err := doSSH(ctx, &c); err != nil {
+				if err := doSSH(ctx, &c, sshSubsystem); err != nil {
 					log.Println(err)
 				}
 			}
